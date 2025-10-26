@@ -75,8 +75,84 @@ public class Storm {
         registeredModels.put(model.getClass(), parsed);
     }
 
+    /**
+     * Sort models by their dependency order using topological sort.
+     * Models with foreign key dependencies will be created after their referenced models.
+     * 
+     * This is particularly important for MySQL, which requires referenced tables to exist
+     * before creating foreign key constraints. SQLite is more tolerant of this.
+     */
+    private List<Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>>> sortModelsByDependencies(
+            List<Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>>> models) {
+        
+        List<Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>>> result = new ArrayList<>();
+        Set<Class<? extends StormModel>> visited = new HashSet<>();
+        Set<Class<? extends StormModel>> visiting = new HashSet<>();
+        
+        for (Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>> entry : models) {
+            if (!visited.contains(entry.getKey())) {
+                visitModel(entry, models, result, visited, visiting);
+            }
+        }
+        
+        return result;
+    }
+    
+    private void visitModel(Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>> entry,
+                           List<Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>>> allModels,
+                           List<Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>>> result,
+                           Set<Class<? extends StormModel>> visited,
+                           Set<Class<? extends StormModel>> visiting) {
+        
+        Class<? extends StormModel> currentModel = entry.getKey();
+        
+        if (visiting.contains(currentModel)) {
+            throw new IllegalStateException("Circular dependency detected involving model: " + currentModel.getName());
+        }
+        
+        if (visited.contains(currentModel)) {
+            return;
+        }
+        
+        visiting.add(currentModel);
+        
+        // Find all models that this model depends on (through foreign keys)
+        ModelParser<? extends StormModel> parser = entry.getValue();
+        for (ParsedField field : parser.getParsedFields()) {
+            if (field.getKeyType() == com.craftmend.storm.api.enums.KeyType.FOREIGN) {
+                try {
+                    // Get the referenced model class
+                    ModelParser<? extends StormModel> referencedParser = 
+                        com.craftmend.storm.utils.Reflection.getAnnotatedReference(this, field.getReflectedField());
+                    Class<? extends StormModel> referencedModel = referencedParser.getOwnType();
+                    
+                    // Find the entry for the referenced model and visit it first
+                    for (Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>> otherEntry : allModels) {
+                        if (otherEntry.getKey() == referencedModel) {
+                            visitModel(otherEntry, allModels, result, visited, visiting);
+                            break;
+                        }
+                    }
+                } catch (Exception e) {
+                    // Ignore if reference resolution fails - this might happen if the referenced model isn't registered yet
+                    logger.warning("Could not resolve foreign key reference in " + currentModel.getName() + 
+                                 "." + field.getJavaFieldName() + ": " + e.getMessage());
+                }
+            }
+        }
+        
+        visiting.remove(currentModel);
+        visited.add(currentModel);
+        result.add(entry);
+    }
+
     public void runMigrations() throws SQLException {
-        for (Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>> entry : registeredModels.entrySet()) {
+        // Sort models by dependency order (tables with foreign keys come after their referenced tables)
+        // This is crucial for MySQL which requires referenced tables to exist before creating foreign keys
+        List<Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>>> sortedModels = 
+            sortModelsByDependencies(new ArrayList<>(registeredModels.entrySet()));
+        
+        for (Map.Entry<Class<? extends StormModel>, ModelParser<? extends StormModel>> entry : sortedModels) {
             ModelParser<? extends StormModel> parsed = entry.getValue();
             StormModel model = parsed.getEmptyInstance();
             if (parsed.isMigrated()) continue;
